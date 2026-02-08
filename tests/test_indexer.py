@@ -2,6 +2,7 @@
 Unit tests for the folder indexer.
 """
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import pytest
 
 from folder_mover.indexer import (
     FolderIndexer,
+    HAS_AHOCORASICK,
+    MatcherNotAvailableError,
     match_caseids,
     scan_folders,
 )
@@ -104,19 +107,14 @@ class TestScanFolders:
 
     def test_scan_file_raises(self):
         """File path raises NotADirectoryError."""
-        import os
-        import tempfile
-        from pathlib import Path
-
+        # Use mkstemp and close fd immediately for Windows compatibility
         fd, path = tempfile.mkstemp()
-        os.close(fd)  # critical on Windows
-
+        os.close(fd)
         try:
             with pytest.raises(NotADirectoryError):
                 scan_folders(path)
         finally:
             Path(path).unlink(missing_ok=True)
-
 
     def test_folder_entry_equality(self):
         """FolderEntry equality is based on path."""
@@ -442,3 +440,239 @@ class TestIntegration:
 
             results = match_caseids(["TARGET"], folders)
             assert len(results["TARGET"]) == 1
+
+
+class TestMatcherSelection:
+    """Tests for matcher selection and availability."""
+
+    def test_bucket_matcher_always_available(self):
+        """Bucket matcher should always work."""
+        folders = [
+            FolderEntry(name="Case_00123", path="/data/Case_00123"),
+        ]
+        case_ids = ["00123"]
+
+        results = match_caseids(case_ids, folders, matcher="bucket")
+        assert len(results["00123"]) == 1
+
+    def test_aho_matcher_raises_if_not_available(self):
+        """Aho matcher should raise MatcherNotAvailableError if pyahocorasick not installed."""
+        if HAS_AHOCORASICK:
+            pytest.skip("pyahocorasick is installed, cannot test unavailable error")
+
+        folders = [FolderEntry(name="test", path="/test")]
+        case_ids = ["test"]
+
+        with pytest.raises(MatcherNotAvailableError):
+            match_caseids(case_ids, folders, matcher="aho")
+
+    @pytest.mark.skipif(not HAS_AHOCORASICK, reason="pyahocorasick not installed")
+    def test_aho_matcher_works_when_available(self):
+        """Aho matcher should work when pyahocorasick is installed."""
+        folders = [
+            FolderEntry(name="Case_00123", path="/data/Case_00123"),
+        ]
+        case_ids = ["00123"]
+
+        results = match_caseids(case_ids, folders, matcher="aho")
+        assert len(results["00123"]) == 1
+
+    def test_default_matcher_is_bucket(self):
+        """Default matcher should be bucket."""
+        folders = [
+            FolderEntry(name="Test_ABC", path="/data/Test_ABC"),
+        ]
+        case_ids = ["ABC"]
+
+        # Not specifying matcher should use bucket (no exception even if aho not available)
+        results = match_caseids(case_ids, folders)
+        assert len(results["ABC"]) == 1
+
+
+class TestMatcherParity:
+    """Tests to verify bucket and aho matchers produce identical results."""
+
+    @pytest.fixture
+    def sample_folders(self):
+        """Sample folder set for parity testing."""
+        return [
+            FolderEntry(name="Case_00123_Smith", path="/data/Case_00123_Smith"),
+            FolderEntry(name="Case_00456_Jones", path="/data/Case_00456_Jones"),
+            FolderEntry(name="00123_Duplicate", path="/archive/00123_Duplicate"),
+            FolderEntry(name="Project_ABC_2023", path="/projects/Project_ABC_2023"),
+            FolderEntry(name="ABC_Another", path="/projects/ABC_Another"),
+            FolderEntry(name="CASE_abc_lower", path="/data/CASE_abc_lower"),
+            FolderEntry(name="NoMatch_Folder", path="/other/NoMatch_Folder"),
+            FolderEntry(name="Special-Chars.001", path="/special/Special-Chars.001"),
+            FolderEntry(name="123_NumericStart", path="/numeric/123_NumericStart"),
+            FolderEntry(name="VeryLongFolderNameWithMultipleMatches_ABC_123", path="/long/x"),
+        ]
+
+    @pytest.fixture
+    def sample_caseids(self):
+        """Sample CaseID set for parity testing."""
+        return [
+            "00123",      # Multiple matches
+            "00456",      # Single match
+            "ABC",        # Case-insensitive matches
+            "99999",      # No matches
+            "001",        # Partial match of 00123
+            "123",        # Matches 00123, 123_NumericStart, and long folder
+            "Special",    # Special characters
+        ]
+
+    @pytest.mark.skipif(not HAS_AHOCORASICK, reason="pyahocorasick not installed")
+    def test_parity_case_insensitive(self, sample_folders, sample_caseids):
+        """Bucket and aho matchers should produce identical results (case-insensitive)."""
+        bucket_results = match_caseids(
+            sample_caseids, sample_folders,
+            case_sensitive=False, matcher="bucket"
+        )
+        aho_results = match_caseids(
+            sample_caseids, sample_folders,
+            case_sensitive=False, matcher="aho"
+        )
+
+        # Same keys
+        assert set(bucket_results.keys()) == set(aho_results.keys())
+
+        # Same matches for each CaseID
+        for case_id in sample_caseids:
+            bucket_paths = {f.path for f in bucket_results[case_id]}
+            aho_paths = {f.path for f in aho_results[case_id]}
+            assert bucket_paths == aho_paths, f"Mismatch for CaseID '{case_id}'"
+
+    @pytest.mark.skipif(not HAS_AHOCORASICK, reason="pyahocorasick not installed")
+    def test_parity_case_sensitive(self, sample_folders, sample_caseids):
+        """Bucket and aho matchers should produce identical results (case-sensitive)."""
+        bucket_results = match_caseids(
+            sample_caseids, sample_folders,
+            case_sensitive=True, matcher="bucket"
+        )
+        aho_results = match_caseids(
+            sample_caseids, sample_folders,
+            case_sensitive=True, matcher="aho"
+        )
+
+        # Same keys
+        assert set(bucket_results.keys()) == set(aho_results.keys())
+
+        # Same matches for each CaseID
+        for case_id in sample_caseids:
+            bucket_paths = {f.path for f in bucket_results[case_id]}
+            aho_paths = {f.path for f in aho_results[case_id]}
+            assert bucket_paths == aho_paths, f"Mismatch for CaseID '{case_id}'"
+
+    @pytest.mark.skipif(not HAS_AHOCORASICK, reason="pyahocorasick not installed")
+    def test_parity_with_real_folders(self):
+        """Parity test with actual folder structure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            structure = {
+                "2023": {
+                    "Case_00123_Smith": {},
+                    "Case_00456_Jones": {},
+                },
+                "2022": {
+                    "Case_00123_Old": {},
+                    "Project_ABC": {},
+                },
+                "Archive": {
+                    "ABC_Files": {},
+                    "Other": {},
+                }
+            }
+            create_test_tree(structure, Path(tmp))
+
+            folders = scan_folders(tmp)
+            case_ids = ["00123", "00456", "ABC", "99999"]
+
+            bucket_results = match_caseids(case_ids, folders, matcher="bucket")
+            aho_results = match_caseids(case_ids, folders, matcher="aho")
+
+            for case_id in case_ids:
+                bucket_count = len(bucket_results[case_id])
+                aho_count = len(aho_results[case_id])
+                assert bucket_count == aho_count, f"Count mismatch for {case_id}"
+
+                bucket_names = {f.name for f in bucket_results[case_id]}
+                aho_names = {f.name for f in aho_results[case_id]}
+                assert bucket_names == aho_names, f"Name mismatch for {case_id}"
+
+    @pytest.mark.skipif(not HAS_AHOCORASICK, reason="pyahocorasick not installed")
+    def test_parity_empty_inputs(self):
+        """Both matchers handle empty inputs identically."""
+        # Empty folders
+        bucket = match_caseids(["A", "B"], [], matcher="bucket")
+        aho = match_caseids(["A", "B"], [], matcher="aho")
+        assert bucket == aho
+
+        # Empty CaseIDs
+        folders = [FolderEntry(name="test", path="/test")]
+        bucket = match_caseids([], folders, matcher="bucket")
+        aho = match_caseids([], folders, matcher="aho")
+        assert bucket == aho
+
+    @pytest.mark.skipif(not HAS_AHOCORASICK, reason="pyahocorasick not installed")
+    def test_parity_overlapping_caseids(self):
+        """Both matchers handle overlapping CaseIDs correctly."""
+        folders = [
+            FolderEntry(name="ABC123XYZ", path="/a"),
+            FolderEntry(name="123ABC", path="/b"),
+            FolderEntry(name="XYZ", path="/c"),
+        ]
+        # CaseIDs that overlap in the folder names
+        case_ids = ["ABC", "123", "ABC123", "XYZ"]
+
+        bucket_results = match_caseids(case_ids, folders, matcher="bucket")
+        aho_results = match_caseids(case_ids, folders, matcher="aho")
+
+        for case_id in case_ids:
+            bucket_paths = {f.path for f in bucket_results[case_id]}
+            aho_paths = {f.path for f in aho_results[case_id]}
+            assert bucket_paths == aho_paths, f"Mismatch for overlapping CaseID '{case_id}'"
+
+
+class TestFolderIndexerMatcher:
+    """Tests for FolderIndexer with matcher parameter."""
+
+    def test_indexer_default_matcher(self):
+        """FolderIndexer uses bucket matcher by default."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "Test_ABC").mkdir()
+
+            indexer = FolderIndexer(tmp)
+            assert indexer.matcher == "bucket"
+
+    def test_indexer_with_bucket_matcher(self):
+        """FolderIndexer works with explicit bucket matcher."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "Case_00123").mkdir()
+
+            indexer = FolderIndexer(tmp, matcher="bucket")
+            matches = indexer.find_matches("00123")
+
+            assert len(matches) == 1
+
+    @pytest.mark.skipif(not HAS_AHOCORASICK, reason="pyahocorasick not installed")
+    def test_indexer_with_aho_matcher(self):
+        """FolderIndexer works with aho matcher when available."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "Case_00123").mkdir()
+
+            indexer = FolderIndexer(tmp, matcher="aho")
+            matches = indexer.find_matches("00123")
+
+            assert len(matches) == 1
+
+    def test_indexer_aho_raises_if_unavailable(self):
+        """FolderIndexer with aho matcher raises if pyahocorasick not installed."""
+        if HAS_AHOCORASICK:
+            pytest.skip("pyahocorasick is installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "Test").mkdir()
+
+            indexer = FolderIndexer(tmp, matcher="aho")
+
+            with pytest.raises(MatcherNotAvailableError):
+                indexer.find_matches("Test")
