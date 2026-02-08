@@ -104,12 +104,19 @@ class TestScanFolders:
 
     def test_scan_file_raises(self):
         """File path raises NotADirectoryError."""
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            try:
-                with pytest.raises(NotADirectoryError):
-                    scan_folders(f.name)
-            finally:
-                Path(f.name).unlink()
+        import os
+        import tempfile
+        from pathlib import Path
+
+        fd, path = tempfile.mkstemp()
+        os.close(fd)  # critical on Windows
+
+        try:
+            with pytest.raises(NotADirectoryError):
+                scan_folders(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
 
     def test_folder_entry_equality(self):
         """FolderEntry equality is based on path."""
