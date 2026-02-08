@@ -6,20 +6,66 @@ This module is responsible for:
 - Handling name collisions with _1, _2, etc. suffixes
 - Supporting dry-run mode (no actual moves)
 - Ensuring idempotency (skip if already moved or source missing)
+- Exclusion patterns to skip certain folders
+- Resume from previous run to avoid reprocessing
 - Catching and recording errors (permissions, locked files, etc.)
 - Logging all operations
 - Returning detailed results for reporting
 """
 
+import fnmatch
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Literal, Optional, Set, Union
 
 from .types import FolderMatch, MoveResult, MoveStatus
+from .utils import (
+    normalize_path,
+    safe_move,
+    to_extended_length_path,
+)
+
+# Type for on_dest_exists behavior
+DestExistsBehavior = Literal["rename", "skip"]
 
 logger = logging.getLogger(__name__)
+
+
+def matches_exclusion_pattern(folder_name: str, patterns: List[str]) -> Optional[str]:
+    """
+    Check if a folder name matches any exclusion pattern.
+
+    Patterns can be:
+    - Simple substrings: "temp" matches "my_temp_folder"
+    - Glob patterns: "*.bak" matches "file.bak", "Case_*_Old" matches "Case_123_Old"
+
+    Args:
+        folder_name: The folder name to check
+        patterns: List of exclusion patterns
+
+    Returns:
+        The matching pattern if found, None otherwise
+    """
+    if not patterns:
+        return None
+
+    folder_lower = folder_name.lower()
+
+    for pattern in patterns:
+        pattern_lower = pattern.lower()
+
+        # Try fnmatch first (handles *, ?, [seq])
+        if fnmatch.fnmatch(folder_lower, pattern_lower):
+            return pattern
+
+        # Also try simple substring match
+        if pattern_lower in folder_lower:
+            return pattern
+
+    return None
 
 
 def resolve_destination(
@@ -42,20 +88,28 @@ def resolve_destination(
     Returns:
         The full destination path (unique, may have suffix)
     """
-    dest_root = Path(dest_root)
+    dest_root_str = normalize_path(dest_root)
+    dest_root_path = Path(dest_root_str)
     existing_names = existing_names or set()
 
+    def _path_exists(path: Path) -> bool:
+        """Check if path exists, using extended-length path on Windows."""
+        path_str = str(path)
+        if sys.platform == "win32":
+            path_str = to_extended_length_path(path_str)
+        return os.path.exists(path_str)
+
     # Try the original name first
-    candidate = dest_root / folder_name
-    if not candidate.exists() and folder_name not in existing_names:
+    candidate = dest_root_path / folder_name
+    if not _path_exists(candidate) and folder_name not in existing_names:
         return str(candidate)
 
     # Find a unique suffix
     counter = 1
     while True:
         suffixed_name = f"{folder_name}_{counter}"
-        candidate = dest_root / suffixed_name
-        if not candidate.exists() and suffixed_name not in existing_names:
+        candidate = dest_root_path / suffixed_name
+        if not _path_exists(candidate) and suffixed_name not in existing_names:
             return str(candidate)
         counter += 1
 
@@ -79,7 +133,8 @@ def move_folder(
     - Missing source (skips with SKIPPED_MISSING status)
     - Permission errors
     - Cross-volume moves (via shutil.move copy+delete)
-    - Long paths on Windows
+    - Long paths on Windows (using \\\\?\\ prefix)
+    - UNC paths (\\\\server\\share)
 
     Args:
         src_path: Source folder path
@@ -89,110 +144,96 @@ def move_folder(
     Returns:
         MoveResult with status and details
     """
-    src_path = Path(src_path)
-    dest_path = Path(dest_path)
+    # Normalize paths for consistent handling
+    src_str = normalize_path(src_path)
+    dest_str = normalize_path(dest_path)
 
-    # Extract case_id from the context (we'll use folder name as fallback)
-    folder_name = src_path.name
+    src_path_obj = Path(src_str)
+    dest_path_obj = Path(dest_str)
+
+    # For filesystem checks, use extended-length paths on Windows
+    src_check = to_extended_length_path(src_str) if sys.platform == "win32" else src_str
+    dest_check = to_extended_length_path(dest_str) if sys.platform == "win32" else dest_str
 
     # Check if source exists
-    if not src_path.exists():
-        logger.info(f"Source missing (already moved?): {src_path}")
+    if not os.path.exists(src_check):
+        logger.info(f"Source missing (already moved?): {src_str}")
         return MoveResult(
             case_id="",  # Will be set by caller
-            source_path=str(src_path),
+            source_path=src_str,
             dest_path=None,
             status=MoveStatus.SKIPPED_MISSING,
             message="Source folder no longer exists (may have been moved already)"
         )
 
     # Check if source is a directory
-    if not src_path.is_dir():
-        logger.error(f"Source is not a directory: {src_path}")
+    if not os.path.isdir(src_check):
+        logger.error(f"Source is not a directory: {src_str}")
         return MoveResult(
             case_id="",
-            source_path=str(src_path),
+            source_path=src_str,
             dest_path=None,
             status=MoveStatus.ERROR,
             message="Source path is not a directory"
         )
 
     # Check if destination already exists
-    if dest_path.exists():
-        logger.warning(f"Destination already exists: {dest_path}")
+    if os.path.exists(dest_check):
+        logger.warning(f"Destination already exists: {dest_str}")
         return MoveResult(
             case_id="",
-            source_path=str(src_path),
-            dest_path=str(dest_path),
+            source_path=src_str,
+            dest_path=dest_str,
             status=MoveStatus.SKIPPED_EXISTS,
             message="Destination already exists"
         )
 
     # Dry run - just report what would happen
     if dry_run:
-        logger.info(f"[DRY RUN] {src_path} -> {dest_path}")
+        logger.info(f"[DRY RUN] {src_str} -> {dest_str}")
         return MoveResult(
             case_id="",
-            source_path=str(src_path),
-            dest_path=str(dest_path),
+            source_path=src_str,
+            dest_path=dest_str,
             status=MoveStatus.DRY_RUN,
-            message=f"Would move to {dest_path}"
+            message=f"Would move to {dest_str}"
         )
 
-    # Perform the actual move
+    # Ensure destination parent exists
+    dest_parent = dest_path_obj.parent
+    dest_parent_check = to_extended_length_path(str(dest_parent)) if sys.platform == "win32" else str(dest_parent)
     try:
-        # Ensure destination parent exists
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Use shutil.move which handles cross-volume moves
-        logger.info(f"Moving: {src_path} -> {dest_path}")
-        shutil.move(str(src_path), str(dest_path))
-
-        return MoveResult(
-            case_id="",
-            source_path=str(src_path),
-            dest_path=str(dest_path),
-            status=MoveStatus.SUCCESS,
-            message="Moved successfully"
-        )
-
-    except PermissionError as e:
-        logger.error(f"Permission denied moving {src_path}: {e}")
-        return MoveResult(
-            case_id="",
-            source_path=str(src_path),
-            dest_path=str(dest_path),
-            status=MoveStatus.ERROR,
-            message=f"Permission denied: {e}"
-        )
-
+        os.makedirs(dest_parent_check, exist_ok=True)
     except OSError as e:
-        # Catch various OS errors: path too long, file locked, etc.
-        error_msg = str(e)
-
-        # Provide more helpful messages for common errors
-        if "WinError 206" in error_msg or "name too long" in error_msg.lower():
-            error_msg = f"Path too long: {e}"
-        elif "WinError 32" in error_msg or "being used" in error_msg.lower():
-            error_msg = f"File/folder is locked or in use: {e}"
-
-        logger.error(f"OS error moving {src_path}: {error_msg}")
+        logger.error(f"Cannot create destination parent {dest_parent}: {e}")
         return MoveResult(
             case_id="",
-            source_path=str(src_path),
-            dest_path=str(dest_path),
+            source_path=src_str,
+            dest_path=dest_str,
             status=MoveStatus.ERROR,
-            message=error_msg
+            message=f"Cannot create destination directory: {e}"
         )
 
-    except Exception as e:
-        logger.error(f"Unexpected error moving {src_path}: {e}")
+    # Perform the actual move using safe_move (handles long paths, cross-volume, etc.)
+    logger.info(f"Moving: {src_str} -> {dest_str}")
+    success, message = safe_move(src_str, dest_str, use_extended_paths=True)
+
+    if success:
         return MoveResult(
             case_id="",
-            source_path=str(src_path),
-            dest_path=str(dest_path),
+            source_path=src_str,
+            dest_path=dest_str,
+            status=MoveStatus.SUCCESS,
+            message=message
+        )
+    else:
+        logger.error(f"Move failed: {src_str} -> {dest_str}: {message}")
+        return MoveResult(
+            case_id="",
+            source_path=src_str,
+            dest_path=dest_str,
             status=MoveStatus.ERROR,
-            message=f"Unexpected error: {e}"
+            message=message
         )
 
 
@@ -208,7 +249,10 @@ class FolderMover:
         self,
         dest_root: Union[str, Path],
         dry_run: bool = False,
-        max_moves: Optional[int] = None
+        max_moves: Optional[int] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        on_dest_exists: DestExistsBehavior = "rename",
+        already_moved_paths: Optional[Set[str]] = None
     ):
         """
         Initialize the mover with destination settings.
@@ -217,10 +261,27 @@ class FolderMover:
             dest_root: The destination root directory
             dry_run: If True, simulate moves without actually performing them
             max_moves: Optional limit on number of moves (for safety testing)
+            exclude_patterns: List of patterns to exclude (substring or fnmatch)
+            on_dest_exists: Behavior when destination exists: "rename" (add suffix)
+                           or "skip" (skip the move)
+            already_moved_paths: Set of source paths already moved in a previous run
+                                (for resume functionality)
         """
         self.dest_root = Path(dest_root)
         self.dry_run = dry_run
         self.max_moves = max_moves
+        self.exclude_patterns = exclude_patterns or []
+        self.on_dest_exists = on_dest_exists
+        self.already_moved_paths = already_moved_paths or set()
+
+        # Normalize already_moved_paths for consistent comparison
+        self._normalized_moved_paths: Set[str] = set()
+        for path in self.already_moved_paths:
+            try:
+                self._normalized_moved_paths.add(normalize_path(path))
+            except (OSError, ValueError):
+                # Path may no longer exist, keep original
+                self._normalized_moved_paths.add(path)
 
         # Track names we've claimed during this session
         # (prevents collisions between moves in the same batch)
@@ -233,8 +294,11 @@ class FolderMover:
         """
         Move a matched folder to the destination root.
 
-        Handles collisions by appending _1, _2, etc. to folder names.
-        Tracks claimed names to prevent collisions within a batch.
+        Handles:
+        - Exclusion patterns (SKIPPED_EXCLUDED)
+        - Resume from previous run (SKIPPED_RESUME)
+        - Collisions by appending _1, _2, etc. or skipping based on on_dest_exists
+        - Tracks claimed names to prevent collisions within a batch
 
         Args:
             match: The FolderMatch describing the folder to move
@@ -244,6 +308,39 @@ class FolderMover:
         """
         src_path = Path(match.source_path)
         folder_name = match.folder_name
+
+        # Check exclusion patterns first
+        if self.exclude_patterns:
+            matched_pattern = matches_exclusion_pattern(folder_name, self.exclude_patterns)
+            if matched_pattern:
+                logger.info(f"Excluded by pattern '{matched_pattern}': {folder_name}")
+                result = MoveResult(
+                    case_id=match.case_id,
+                    source_path=match.source_path,
+                    dest_path=None,
+                    status=MoveStatus.SKIPPED_EXCLUDED,
+                    message=f"Excluded by pattern: {matched_pattern}"
+                )
+                self._stats[result.status] += 1
+                return result
+
+        # Check if already processed in a previous run (resume)
+        try:
+            normalized_src = normalize_path(match.source_path)
+        except (OSError, ValueError):
+            normalized_src = match.source_path
+
+        if normalized_src in self._normalized_moved_paths or match.source_path in self._normalized_moved_paths:
+            logger.info(f"Already processed in previous run: {match.source_path}")
+            result = MoveResult(
+                case_id=match.case_id,
+                source_path=match.source_path,
+                dest_path=None,
+                status=MoveStatus.SKIPPED_RESUME,
+                message="Already processed in previous run (resumed)"
+            )
+            self._stats[result.status] += 1
+            return result
 
         # Check if source exists before resolving destination
         if not src_path.exists():
@@ -257,7 +354,25 @@ class FolderMover:
             self._stats[result.status] += 1
             return result
 
-        # Resolve unique destination path
+        # Check if destination with original name already exists
+        original_dest = self.dest_root / folder_name
+        original_dest_check = to_extended_length_path(str(original_dest)) if sys.platform == "win32" else str(original_dest)
+        dest_exists = os.path.exists(original_dest_check) or folder_name in self._claimed_names
+
+        # Handle on_dest_exists behavior
+        if dest_exists and self.on_dest_exists == "skip":
+            logger.info(f"Destination exists, skipping (--on-dest-exists=skip): {folder_name}")
+            result = MoveResult(
+                case_id=match.case_id,
+                source_path=match.source_path,
+                dest_path=str(original_dest),
+                status=MoveStatus.SKIPPED_EXISTS,
+                message="Destination exists (skipped due to --on-dest-exists=skip)"
+            )
+            self._stats[result.status] += 1
+            return result
+
+        # Resolve unique destination path (will add suffix if needed when on_dest_exists=rename)
         dest_path = resolve_destination(
             self.dest_root,
             folder_name,
@@ -365,7 +480,10 @@ class FolderMover:
         success_count = stats.get("success", 0) + stats.get("success_renamed", 0)
         dry_run_count = stats.get("dry_run", 0) + stats.get("dry_run_renamed", 0)
         skipped_count = (
-            stats.get("skipped_missing", 0) + stats.get("skipped_exists", 0)
+            stats.get("skipped_missing", 0) +
+            stats.get("skipped_exists", 0) +
+            stats.get("skipped_excluded", 0) +
+            stats.get("skipped_resume", 0)
         )
         error_count = stats.get("error", 0)
 
@@ -391,6 +509,14 @@ class FolderMover:
             if stats.get("skipped_exists", 0):
                 lines.append(
                     f"    (already exists: {stats.get('skipped_exists', 0)})"
+                )
+            if stats.get("skipped_excluded", 0):
+                lines.append(
+                    f"    (excluded: {stats.get('skipped_excluded', 0)})"
+                )
+            if stats.get("skipped_resume", 0):
+                lines.append(
+                    f"    (resume skip: {stats.get('skipped_resume', 0)})"
                 )
 
         if error_count:

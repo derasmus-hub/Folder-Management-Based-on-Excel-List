@@ -9,20 +9,82 @@ This module is responsible for:
 """
 
 import argparse
+import csv
 import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from . import __version__
 from .excel import load_case_ids
-from .indexer import FolderIndexer, match_caseids, scan_folders
+from .indexer import (
+    FolderIndexer,
+    HAS_AHOCORASICK,
+    MatcherNotAvailableError,
+    match_caseids,
+    scan_folders,
+)
 from .mover import FolderMover
 from .report import ReportWriter
 from .types import FolderMatch, MoveStatus
 
 logger = logging.getLogger(__name__)
+
+# Status values in CSV reports that indicate a successful move
+MOVED_STATUSES = {"MOVED", "MOVED_RENAMED"}
+
+
+def load_moved_paths_from_report(report_path: Path) -> Set[str]:
+    """
+    Load source paths that were successfully moved in a previous run.
+
+    This enables resume functionality - if a run is interrupted, the user
+    can re-run with --resume-from-report to skip already-moved folders.
+
+    Args:
+        report_path: Path to a previous CSV report
+
+    Returns:
+        Set of source paths that had status MOVED or MOVED_RENAMED
+
+    Raises:
+        FileNotFoundError: If the report file doesn't exist
+        ValueError: If the report is missing required columns
+    """
+    if not report_path.exists():
+        raise FileNotFoundError(f"Resume report not found: {report_path}")
+
+    moved_paths: Set[str] = set()
+
+    logger.info(f"Loading moved paths from resume report: {report_path}")
+
+    with open(report_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+
+        # Validate required columns
+        required_cols = {"status", "source_path"}
+        if reader.fieldnames is None:
+            raise ValueError(f"Resume report is empty or invalid: {report_path}")
+
+        actual_cols = set(reader.fieldnames)
+        missing = required_cols - actual_cols
+        if missing:
+            raise ValueError(
+                f"Resume report missing required columns: {missing}. "
+                f"Found: {reader.fieldnames}"
+            )
+
+        # Collect moved paths
+        for row in reader:
+            status = row.get("status", "").strip()
+            source_path = row.get("source_path", "").strip()
+
+            if status in MOVED_STATUSES and source_path:
+                moved_paths.add(source_path)
+
+    logger.info(f"Loaded {len(moved_paths)} already-moved paths from resume report")
+    return moved_paths
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -51,14 +113,25 @@ Examples:
   # Safe test run (move only 1 folder)
   %(prog)s caselist.xlsx C:\\Data\\Source C:\\Data\\Dest --max-moves 1
 
+  # Exclude temp and backup folders
+  %(prog)s caselist.xlsx C:\\Data\\Source C:\\Data\\Dest --exclude-pattern "*.tmp" --exclude-pattern "*_backup"
+
+  # Skip existing instead of renaming
+  %(prog)s caselist.xlsx C:\\Data\\Source C:\\Data\\Dest --on-dest-exists skip
+
+  # Resume from a previous interrupted run
+  %(prog)s caselist.xlsx C:\\Data\\Source C:\\Data\\Dest --resume-from-report prev_report.csv
+
   # Verbose with all options
   %(prog)s caselist.xlsx C:\\Data\\Source C:\\Data\\Dest -v --dry-run --report out.csv
 
 Notes:
   - CaseIDs are read as strings to preserve leading zeros
-  - Name collisions are handled by appending _1, _2, etc.
+  - Name collisions are handled by appending _1, _2, etc. (use --on-dest-exists skip to skip instead)
   - Use --dry-run to preview operations without making changes
   - Use --max-moves for incremental/safe testing
+  - Use --exclude-pattern to skip folders matching glob patterns or substrings
+  - Use --resume-from-report to continue after an interrupted run
         """
     )
 
@@ -133,6 +206,44 @@ Notes:
         default=None,
         metavar="N",
         help="Only process first N CaseIDs from Excel (for testing)"
+    )
+
+    # Matching algorithm
+    parser.add_argument(
+        "--matcher",
+        type=str,
+        choices=["bucket", "aho"],
+        default="bucket",
+        metavar="ALGO",
+        help="Matching algorithm: 'bucket' (default) or 'aho' (requires pyahocorasick)"
+    )
+
+    # Safety features
+    parser.add_argument(
+        "--exclude-pattern",
+        type=str,
+        action="append",
+        default=[],
+        dest="exclude_patterns",
+        metavar="PATTERN",
+        help="Exclude folders matching pattern (glob or substring). Can be specified multiple times."
+    )
+    parser.add_argument(
+        "--on-dest-exists",
+        type=str,
+        choices=["rename", "skip"],
+        default="rename",
+        dest="on_dest_exists",
+        metavar="ACTION",
+        help="Action when destination exists: 'rename' (add _1, _2, default) or 'skip'"
+    )
+    parser.add_argument(
+        "--resume-from-report",
+        type=Path,
+        default=None,
+        dest="resume_report",
+        metavar="CSV",
+        help="Resume from a previous report, skipping folders already moved (MOVED/MOVED_RENAMED status)"
     )
 
     # Verbosity
@@ -216,9 +327,13 @@ def get_run_parameters(args: argparse.Namespace) -> Dict[str, str]:
         "dry_run": str(args.dry_run),
         "report": str(args.report.resolve()) if args.report else "",
         "sheet": args.sheet or "(active)",
+        "matcher": args.matcher,
         "max_folders": str(args.max_folders) if args.max_folders else "",
         "max_moves": str(args.max_moves) if args.max_moves else "",
         "caseid_limit": str(args.caseid_limit) if args.caseid_limit else "",
+        "exclude_patterns": ",".join(args.exclude_patterns) if args.exclude_patterns else "",
+        "on_dest_exists": args.on_dest_exists,
+        "resume_report": str(args.resume_report.resolve()) if args.resume_report else "",
     }
     return params
 
@@ -279,6 +394,14 @@ def print_banner(args: argparse.Namespace) -> None:
     if limits:
         print(f"Limits:       {', '.join(limits)}")
 
+    # Show safety features
+    if args.exclude_patterns:
+        print(f"Exclusions:   {', '.join(args.exclude_patterns)}")
+    if args.on_dest_exists != "rename":
+        print(f"On exists:    {args.on_dest_exists}")
+    if args.resume_report:
+        print(f"Resume from:  {args.resume_report}")
+
     print(f"{'='*60}\n")
 
 
@@ -322,13 +445,22 @@ def print_summary(
         if move_stats.get("success_renamed", 0):
             print(f"    (with rename:        {move_stats.get('success_renamed', 0)})")
 
-    skipped = move_stats.get("skipped_missing", 0) + move_stats.get("skipped_exists", 0)
+    skipped = (
+        move_stats.get("skipped_missing", 0) +
+        move_stats.get("skipped_exists", 0) +
+        move_stats.get("skipped_excluded", 0) +
+        move_stats.get("skipped_resume", 0)
+    )
     if skipped:
         print(f"  Skipped:               {skipped}")
         if move_stats.get("skipped_missing", 0):
             print(f"    (source missing:     {move_stats.get('skipped_missing', 0)})")
         if move_stats.get("skipped_exists", 0):
             print(f"    (already exists:     {move_stats.get('skipped_exists', 0)})")
+        if move_stats.get("skipped_excluded", 0):
+            print(f"    (excluded:           {move_stats.get('skipped_excluded', 0)})")
+        if move_stats.get("skipped_resume", 0):
+            print(f"    (resume skip:        {move_stats.get('skipped_resume', 0)})")
 
     errors = move_stats.get("error", 0)
     if errors:
@@ -396,8 +528,13 @@ def main(argv: list = None) -> int:
         print(f"  Found {len(folders)} folders")
 
         # Step 3: Match CaseIDs to folders
-        print("\nStep 3: Matching CaseIDs to folders...")
-        matches_by_caseid = match_caseids(case_ids, folders)
+        matcher_str = args.matcher
+        if args.matcher == "aho" and HAS_AHOCORASICK:
+            matcher_str = "aho (Aho-Corasick)"
+        elif args.matcher == "bucket":
+            matcher_str = "bucket (length-bucket)"
+        print(f"\nStep 3: Matching CaseIDs to folders using {matcher_str} matcher...")
+        matches_by_caseid = match_caseids(case_ids, folders, matcher=args.matcher)
 
         # Count matches per CaseID
         match_counts = {cid: len(matches) for cid, matches in matches_by_caseid.items()}
@@ -429,6 +566,13 @@ def main(argv: list = None) -> int:
             else:
                 logger.info("Confirmation skipped (--yes flag)")
 
+        # Load resume data if resuming from previous report
+        already_moved: Set[str] = set()
+        if args.resume_report:
+            print(f"\nLoading resume data from {args.resume_report}...")
+            already_moved = load_moved_paths_from_report(args.resume_report)
+            print(f"  Found {len(already_moved)} already-moved folders to skip")
+
         # Step 4: Move folders (or dry-run)
         mode_str = "DRY RUN" if args.dry_run else "Moving"
         print(f"\nStep 4: {mode_str} {len(all_matches)} folders...")
@@ -436,7 +580,10 @@ def main(argv: list = None) -> int:
         mover = FolderMover(
             dest_root=args.dest_root,
             dry_run=args.dry_run,
-            max_moves=args.max_moves
+            max_moves=args.max_moves,
+            exclude_patterns=args.exclude_patterns,
+            on_dest_exists=args.on_dest_exists,
+            already_moved_paths=already_moved
         )
 
         results = mover.move_all(all_matches)
@@ -493,6 +640,11 @@ def main(argv: list = None) -> int:
     except ValueError as e:
         print(f"\nError: {e}", file=sys.stderr)
         logger.error(f"Value error: {e}")
+        return 1
+
+    except MatcherNotAvailableError as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        logger.error(f"Matcher not available: {e}")
         return 1
 
     except KeyboardInterrupt:

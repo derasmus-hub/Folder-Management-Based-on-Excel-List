@@ -41,6 +41,8 @@ class MoveStatus(Enum):
     SUCCESS_RENAMED = "success_renamed"  # Moved with suffix due to collision
     SKIPPED_MISSING = "skipped_missing"  # Source no longer exists
     SKIPPED_EXISTS = "skipped_exists"    # Already at destination
+    SKIPPED_EXCLUDED = "skipped_excluded"  # Folder matched exclusion pattern
+    SKIPPED_RESUME = "skipped_resume"    # Already processed in previous run
     ERROR = "error"                  # Failed due to error
     DRY_RUN = "dry_run"              # Would move (dry run mode)
     DRY_RUN_RENAMED = "dry_run_renamed"  # Would move with rename (dry run)
@@ -74,6 +76,8 @@ class ReportStatus(Enum):
     MULTIPLE_MATCHES = "MULTIPLE_MATCHES"  # CaseID matched multiple folders
     SKIPPED_MISSING = "SKIPPED_MISSING"  # Source no longer exists
     SKIPPED_EXISTS = "SKIPPED_EXISTS"    # Already at destination
+    SKIPPED_EXCLUDED = "SKIPPED_EXCLUDED"  # Folder matched exclusion pattern
+    SKIPPED_RESUME = "SKIPPED_RESUME"    # Already processed in previous run
     ERROR = "ERROR"                      # Operation failed
 
     @classmethod
@@ -87,6 +91,8 @@ class ReportStatus(Enum):
             MoveStatus.SUCCESS_RENAMED: cls.MOVED_RENAMED,
             MoveStatus.SKIPPED_MISSING: cls.SKIPPED_MISSING,
             MoveStatus.SKIPPED_EXISTS: cls.SKIPPED_EXISTS,
+            MoveStatus.SKIPPED_EXCLUDED: cls.SKIPPED_EXCLUDED,
+            MoveStatus.SKIPPED_RESUME: cls.SKIPPED_RESUME,
             MoveStatus.ERROR: cls.ERROR,
             MoveStatus.DRY_RUN: cls.FOUND_DRYRUN,
             MoveStatus.DRY_RUN_RENAMED: cls.FOUND_DRYRUN_RENAMED,

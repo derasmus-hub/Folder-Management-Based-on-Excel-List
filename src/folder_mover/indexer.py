@@ -13,10 +13,16 @@ import logging
 import os
 import sys
 from collections import defaultdict
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from .types import FolderEntry, FolderMatch
+from .utils import (
+    from_extended_length_path,
+    normalize_path,
+    to_extended_length_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +30,18 @@ logger = logging.getLogger(__name__)
 try:
     import ahocorasick
     HAS_AHOCORASICK = True
-    logger.debug("pyahocorasick available - using accelerated matching")
 except ImportError:
+    ahocorasick = None  # type: ignore
     HAS_AHOCORASICK = False
-    logger.debug("pyahocorasick not available - using fallback matching")
+
+
+# Matcher type literal for type hints
+MatcherType = Literal["bucket", "aho"]
+
+
+class MatcherNotAvailableError(Exception):
+    """Raised when requested matcher is not available."""
+    pass
 
 
 def scan_folders(
@@ -60,18 +74,11 @@ def scan_folders(
         raise NotADirectoryError(f"Source root is not a directory: {root_path}")
 
     # Normalize path for consistent handling
-    # On Windows, use extended-length path prefix for long paths
-    root_str = str(root_path.resolve())
-    if sys.platform == 'win32' and not root_str.startswith('\\\\?\\'):
-        # Add extended-length path prefix for Windows long path support
-        if root_str.startswith('\\\\'):
-            # UNC path: \\server\share -> \\?\UNC\server\share
-            root_str = '\\\\?\\UNC\\' + root_str[2:]
-        else:
-            # Regular path: C:\path -> \\?\C:\path
-            root_str = '\\\\?\\' + root_str
+    # On Windows, use extended-length path prefix for long path support
+    root_normalized = normalize_path(root_path)
+    root_str = to_extended_length_path(root_normalized)
 
-    logger.info(f"Scanning folders under: {source_root}")
+    logger.info(f"Scanning folders under: {root_normalized}")
 
     folders: List[FolderEntry] = []
     dirs_scanned = 0
@@ -87,12 +94,8 @@ def scan_folders(
                     try:
                         if entry.is_dir(follow_symlinks=follow_symlinks):
                             # Add this folder to results
-                            folder_path = entry.path
-                            # Remove extended-length prefix for cleaner output
-                            if folder_path.startswith('\\\\?\\UNC\\'):
-                                folder_path = '\\\\' + folder_path[8:]
-                            elif folder_path.startswith('\\\\?\\'):
-                                folder_path = folder_path[4:]
+                            # Convert back to normal form for human-readable output
+                            folder_path = from_extended_length_path(entry.path)
 
                             folders.append(FolderEntry(
                                 name=entry.name,
@@ -127,35 +130,46 @@ def scan_folders(
 def match_caseids(
     case_ids: List[str],
     folders: List[FolderEntry],
-    case_sensitive: bool = False
+    case_sensitive: bool = False,
+    matcher: MatcherType = "bucket"
 ) -> Dict[str, List[FolderEntry]]:
     """
     Find folders whose names contain any of the given CaseIDs.
 
-    Uses an optimized matching strategy:
-    1. If pyahocorasick is available, uses Aho-Corasick automaton for O(n+m+z)
-       multi-pattern matching where n=text length, m=pattern length, z=matches
-    2. Otherwise, falls back to length-bucket optimization to reduce comparisons
+    Supports two matching algorithms:
+    - "bucket": Length-bucket optimization (default, no dependencies)
+    - "aho": Aho-Corasick automaton (requires pyahocorasick, faster for large datasets)
 
     Args:
         case_ids: List of CaseID strings to search for
         folders: List of FolderEntry objects to search in
         case_sensitive: Whether matching is case-sensitive (default: False)
+        matcher: Matching algorithm to use ("bucket" or "aho", default: "bucket")
 
     Returns:
         Dictionary mapping each CaseID to list of matching FolderEntry objects.
         CaseIDs with no matches will have empty lists.
+
+    Raises:
+        MatcherNotAvailableError: If matcher="aho" but pyahocorasick is not installed
     """
     if not case_ids or not folders:
         return {cid: [] for cid in case_ids}
 
     logger.info(
-        f"Matching {len(case_ids)} CaseIDs against {len(folders)} folders"
+        f"Matching {len(case_ids)} CaseIDs against {len(folders)} folders "
+        f"using {matcher} matcher"
     )
 
-    if HAS_AHOCORASICK:
+    if matcher == "aho":
+        if not HAS_AHOCORASICK:
+            raise MatcherNotAvailableError(
+                "Aho-Corasick matcher requested but pyahocorasick is not installed. "
+                "Install it with: pip install pyahocorasick"
+            )
         return _match_with_ahocorasick(case_ids, folders, case_sensitive)
     else:
+        # Default to bucket matcher
         return _match_with_length_buckets(case_ids, folders, case_sensitive)
 
 
@@ -286,7 +300,8 @@ class FolderIndexer:
     def __init__(
         self,
         source_root: Union[str, Path],
-        case_sensitive: bool = False
+        case_sensitive: bool = False,
+        matcher: MatcherType = "bucket"
     ):
         """
         Initialize the indexer with a source root directory.
@@ -294,9 +309,11 @@ class FolderIndexer:
         Args:
             source_root: The root directory to scan for folders
             case_sensitive: Whether CaseID matching is case-sensitive
+            matcher: Matching algorithm to use ("bucket" or "aho")
         """
         self.source_root = Path(source_root)
         self.case_sensitive = case_sensitive
+        self.matcher = matcher
         self._folders: Optional[List[FolderEntry]] = None
 
     def build_index(self) -> int:
@@ -329,7 +346,8 @@ class FolderIndexer:
         results = match_caseids(
             [case_id],
             self.folders,
-            self.case_sensitive
+            self.case_sensitive,
+            self.matcher
         )
 
         return [
@@ -357,7 +375,8 @@ class FolderIndexer:
         results = match_caseids(
             case_ids,
             self.folders,
-            self.case_sensitive
+            self.case_sensitive,
+            self.matcher
         )
 
         return {

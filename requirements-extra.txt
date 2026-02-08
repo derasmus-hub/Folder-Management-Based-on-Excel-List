@@ -1,0 +1,10 @@
+# Optional dependencies for enhanced performance
+#
+# Aho-Corasick matcher for faster substring matching with many CaseIDs
+# Install with: pip install -r requirements-extra.txt
+#
+# Note: pyahocorasick requires a C compiler on some platforms.
+# On Windows, you may need Visual Studio Build Tools.
+# On Linux/macOS, gcc/clang should work.
+
+pyahocorasick>=2.0.0

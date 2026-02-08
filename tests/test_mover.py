@@ -9,6 +9,7 @@ import pytest
 
 from folder_mover.mover import (
     FolderMover,
+    matches_exclusion_pattern,
     move_folder,
     resolve_destination,
 )
@@ -489,3 +490,320 @@ class TestEdgeCases:
             assert progress_calls[0] == (1, 3, "0")
             assert progress_calls[1] == (2, 3, "1")
             assert progress_calls[2] == (3, 3, "2")
+
+
+class TestMatchesExclusionPattern:
+    """Tests for matches_exclusion_pattern function."""
+
+    def test_no_patterns(self):
+        """Returns None when no patterns."""
+        assert matches_exclusion_pattern("Folder", []) is None
+
+    def test_exact_match(self):
+        """Matches exact folder name."""
+        result = matches_exclusion_pattern("temp", ["temp"])
+        assert result == "temp"
+
+    def test_substring_match(self):
+        """Matches substring."""
+        result = matches_exclusion_pattern("my_temp_folder", ["temp"])
+        assert result == "temp"
+
+    def test_glob_asterisk(self):
+        """Matches glob with asterisk."""
+        assert matches_exclusion_pattern("file.bak", ["*.bak"]) == "*.bak"
+        assert matches_exclusion_pattern("Case_123_Old", ["*_Old"]) == "*_Old"
+
+    def test_glob_question_mark(self):
+        """Matches glob with question mark."""
+        assert matches_exclusion_pattern("test1", ["test?"]) == "test?"
+        assert matches_exclusion_pattern("test12", ["test?"]) is None  # Too long
+
+    def test_case_insensitive(self):
+        """Matching is case-insensitive."""
+        assert matches_exclusion_pattern("TEMP", ["temp"]) == "temp"
+        assert matches_exclusion_pattern("MyFolder", ["MYFOLDER"]) == "MYFOLDER"
+        assert matches_exclusion_pattern("File.BAK", ["*.bak"]) == "*.bak"
+
+    def test_no_match(self):
+        """Returns None when no match."""
+        assert matches_exclusion_pattern("normal_folder", ["temp", "*.bak"]) is None
+
+
+class TestExclusionPatterns:
+    """Tests for exclusion patterns in FolderMover."""
+
+    def test_exclude_by_substring(self):
+        """Excludes folders by substring."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "source" / "Case_00123_temp"
+            dest_root = base / "dest"
+            src.mkdir(parents=True)
+            dest_root.mkdir()
+
+            match = FolderMatch("00123", str(src), "Case_00123_temp")
+            mover = FolderMover(dest_root, exclude_patterns=["temp"])
+            result = mover.move_folder(match)
+
+            assert result.status == MoveStatus.SKIPPED_EXCLUDED
+            assert "temp" in result.message
+            assert src.exists()  # Not moved
+
+    def test_exclude_by_glob(self):
+        """Excludes folders by glob pattern."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "source" / "backup.bak"
+            dest_root = base / "dest"
+            src.mkdir(parents=True)
+            dest_root.mkdir()
+
+            match = FolderMatch("001", str(src), "backup.bak")
+            mover = FolderMover(dest_root, exclude_patterns=["*.bak"])
+            result = mover.move_folder(match)
+
+            assert result.status == MoveStatus.SKIPPED_EXCLUDED
+            assert "*.bak" in result.message
+
+    def test_multiple_patterns(self):
+        """Tests multiple exclusion patterns."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dest_root = base / "dest"
+            dest_root.mkdir()
+
+            # Create matching and non-matching folders
+            src1 = base / "temp_folder"
+            src2 = base / "backup.bak"
+            src3 = base / "normal_folder"
+            src1.mkdir()
+            src2.mkdir()
+            src3.mkdir()
+
+            matches = [
+                FolderMatch("001", str(src1), "temp_folder"),
+                FolderMatch("002", str(src2), "backup.bak"),
+                FolderMatch("003", str(src3), "normal_folder"),
+            ]
+
+            mover = FolderMover(dest_root, exclude_patterns=["temp", "*.bak"])
+            results = mover.move_all(matches)
+
+            assert results[0].status == MoveStatus.SKIPPED_EXCLUDED
+            assert results[1].status == MoveStatus.SKIPPED_EXCLUDED
+            assert results[2].status == MoveStatus.SUCCESS
+
+    def test_stats_track_excluded(self):
+        """Stats track excluded folders."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "temp_folder"
+            dest_root = base / "dest"
+            src.mkdir()
+            dest_root.mkdir()
+
+            match = FolderMatch("001", str(src), "temp_folder")
+            mover = FolderMover(dest_root, exclude_patterns=["temp"])
+            mover.move_folder(match)
+
+            stats = mover.get_stats()
+            assert stats["skipped_excluded"] == 1
+
+
+class TestOnDestExists:
+    """Tests for on_dest_exists behavior."""
+
+    def test_rename_is_default(self):
+        """Default behavior is rename."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "Case_00123"
+            dest_root = base / "dest"
+            src.mkdir()
+            dest_root.mkdir()
+            (dest_root / "Case_00123").mkdir()  # Collision
+
+            match = FolderMatch("00123", str(src), "Case_00123")
+            mover = FolderMover(dest_root)  # Default on_dest_exists="rename"
+            result = mover.move_folder(match)
+
+            assert result.status == MoveStatus.SUCCESS_RENAMED
+            assert (dest_root / "Case_00123_1").exists()
+
+    def test_skip_on_exists(self):
+        """Skip when destination exists with on_dest_exists='skip'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "Case_00123"
+            dest_root = base / "dest"
+            src.mkdir()
+            dest_root.mkdir()
+            (dest_root / "Case_00123").mkdir()  # Collision
+
+            match = FolderMatch("00123", str(src), "Case_00123")
+            mover = FolderMover(dest_root, on_dest_exists="skip")
+            result = mover.move_folder(match)
+
+            assert result.status == MoveStatus.SKIPPED_EXISTS
+            assert src.exists()  # Not moved
+            assert "skip" in result.message.lower()
+
+    def test_skip_respects_claimed_names(self):
+        """Skip also respects names claimed in session."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dest_root = base / "dest"
+            dest_root.mkdir()
+
+            src1 = base / "loc1" / "SameName"
+            src2 = base / "loc2" / "SameName"
+            src1.mkdir(parents=True)
+            src2.mkdir(parents=True)
+
+            matches = [
+                FolderMatch("001", str(src1), "SameName"),
+                FolderMatch("002", str(src2), "SameName"),
+            ]
+
+            mover = FolderMover(dest_root, on_dest_exists="skip")
+            results = mover.move_all(matches)
+
+            assert results[0].status == MoveStatus.SUCCESS
+            assert results[1].status == MoveStatus.SKIPPED_EXISTS
+
+
+class TestResumeFromReport:
+    """Tests for resume functionality."""
+
+    def test_skip_already_moved_paths(self):
+        """Skips paths that were already moved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "Case_00123"
+            dest_root = base / "dest"
+            src.mkdir()
+            dest_root.mkdir()
+
+            # Pretend this path was already moved in a previous run
+            already_moved = {str(src)}
+
+            match = FolderMatch("00123", str(src), "Case_00123")
+            mover = FolderMover(dest_root, already_moved_paths=already_moved)
+            result = mover.move_folder(match)
+
+            assert result.status == MoveStatus.SKIPPED_RESUME
+            assert src.exists()  # Not moved again
+
+    def test_resume_stats_tracked(self):
+        """Stats track resumed skips."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "Case_00123"
+            dest_root = base / "dest"
+            src.mkdir()
+            dest_root.mkdir()
+
+            already_moved = {str(src)}
+
+            match = FolderMatch("00123", str(src), "Case_00123")
+            mover = FolderMover(dest_root, already_moved_paths=already_moved)
+            mover.move_folder(match)
+
+            stats = mover.get_stats()
+            assert stats["skipped_resume"] == 1
+
+    def test_resume_with_mixed_paths(self):
+        """Handles mix of already-moved and new paths."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dest_root = base / "dest"
+            dest_root.mkdir()
+
+            src1 = base / "Case_001"
+            src2 = base / "Case_002"
+            src1.mkdir()
+            src2.mkdir()
+
+            already_moved = {str(src1)}  # Only first was moved before
+
+            matches = [
+                FolderMatch("001", str(src1), "Case_001"),
+                FolderMatch("002", str(src2), "Case_002"),
+            ]
+
+            mover = FolderMover(dest_root, already_moved_paths=already_moved)
+            results = mover.move_all(matches)
+
+            assert results[0].status == MoveStatus.SKIPPED_RESUME
+            assert results[1].status == MoveStatus.SUCCESS
+
+
+class TestSafetyFeaturesCombined:
+    """Tests for combined safety features."""
+
+    def test_exclusion_checked_before_resume(self):
+        """Exclusion is checked before resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / "temp_folder"
+            dest_root = base / "dest"
+            src.mkdir()
+            dest_root.mkdir()
+
+            # Both excluded AND in resume set
+            already_moved = {str(src)}
+
+            match = FolderMatch("001", str(src), "temp_folder")
+            mover = FolderMover(
+                dest_root,
+                exclude_patterns=["temp"],
+                already_moved_paths=already_moved
+            )
+            result = mover.move_folder(match)
+
+            # Exclusion takes precedence
+            assert result.status == MoveStatus.SKIPPED_EXCLUDED
+
+    def test_all_features_together(self):
+        """All safety features work together."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dest_root = base / "dest"
+            dest_root.mkdir()
+
+            # Create various folders
+            excluded_folder = base / "temp_123"
+            resumed_folder = base / "Case_001"
+            existing_folder = base / "Case_002"
+            normal_folder = base / "Case_003"
+
+            excluded_folder.mkdir()
+            resumed_folder.mkdir()
+            existing_folder.mkdir()
+            normal_folder.mkdir()
+
+            # Create existing destination for Case_002
+            (dest_root / "Case_002").mkdir()
+
+            already_moved = {str(resumed_folder)}
+
+            matches = [
+                FolderMatch("temp", str(excluded_folder), "temp_123"),
+                FolderMatch("001", str(resumed_folder), "Case_001"),
+                FolderMatch("002", str(existing_folder), "Case_002"),
+                FolderMatch("003", str(normal_folder), "Case_003"),
+            ]
+
+            mover = FolderMover(
+                dest_root,
+                exclude_patterns=["temp"],
+                on_dest_exists="skip",
+                already_moved_paths=already_moved
+            )
+            results = mover.move_all(matches)
+
+            assert results[0].status == MoveStatus.SKIPPED_EXCLUDED
+            assert results[1].status == MoveStatus.SKIPPED_RESUME
+            assert results[2].status == MoveStatus.SKIPPED_EXISTS
+            assert results[3].status == MoveStatus.SUCCESS
